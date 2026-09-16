@@ -845,6 +845,9 @@ export default function createServer({ config }: { config: Config }) {
 
       const pending = slices.filter((x) => ["pending", "running", "converting"].includes(x.r.state));
       const failed = slices.filter((x) => x.r.state === "failed");
+      // Anything else must be "done" with a zip; an unknown state without one is reported, not downloaded
+      const odd = slices.filter((x) => !pending.includes(x) && !failed.includes(x) && !(x.r.state === "done" && x.r.full_zip_url));
+      if (odd.length) throw new Error(`Slices in an unexpected state: ${odd.map((x) => `${x.s.start}-${x.s.end} (${x.r.state}${x.r.full_zip_url ? "" : ", no zip"})`).join("; ")}. Check mineru_batch_status.`);
       if (pending.length || failed.length) {
         let text = `Batch ${params.batch_id}: ${slices.length - pending.length - failed.length}/${slices.length} slices done.`;
         if (pending.length) text += `\nStill processing: ${pending.map((x) => `${x.s.start}-${x.s.end}`).join(", ")}`;
