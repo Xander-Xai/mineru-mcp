@@ -97,8 +97,8 @@ Naming uses `author_year_title` convention from the original filename, with spac
 
 ## Limits
 
-- Single file: 200MB max, 600 pages max
-- Daily quota: 2000 pages at high priority
+- Single file: 200MB max, 200 pages max (use `pages` to parse a longer file in ≤200-page slices — verified 2026-09-16)
+- Daily quota: 1000 pages at high priority (excess is deprioritized, not rejected)
 - Batch: max 200 files per request
 - Models: `pipeline` (fast) or `vlm` (90% accuracy, recommended for academic PDFs)
 

@@ -34,7 +34,7 @@ const ERROR_MESSAGES: Record<string, string> = {
   A0211: "Token expired. Get a new API key.",
   "-60002": "Invalid file format. Use: pdf, doc, docx, ppt, pptx, png, jpg, jpeg",
   "-60005": "File too large. Max 200MB.",
-  "-60006": "Too many pages. Max 600 per file. Split the document.",
+  "-60006": "Too many pages. Max 200 per file. Re-submit with pages (e.g. 1-200, 201-400) — ranges are accepted on files longer than 200 pages.",
   "-60008": "URL timeout. Check the URL is accessible.",
   "-60009": "Queue full. Try again later.",
   "-60012": "Task not found. Check task_id is valid.",
