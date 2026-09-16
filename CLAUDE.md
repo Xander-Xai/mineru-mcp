@@ -114,5 +114,10 @@ CI (`.github/workflows/publish-mcp.yml`) publishes on a `v*` tag — to npm (OID
 2. `bun run build` (tsc)
 3. Commit + push (PRs run the build gate)
 4. `git tag vX.Y.Z && git push origin vX.Y.Z` → CI publishes npm then the Registry.
+5. **If the run fails at "Wait for exact npm version to propagate"** (npm took ~9 min on
+   2026-09-16; the wait gives up at 5), the npm publish already succeeded — do not re-tag.
+   Once `curl -sf https://registry.npmjs.org/mineru-mcp/X.Y.Z` returns, run the recovery path:
+   `gh workflow run publish-mcp.yml --ref vX.Y.Z -f registry_tag=vX.Y.Z` (skips npm, publishes
+   the Registry).
 
 **One-time setup (done 2026-06-22):** npm Trusted Publisher for `mineru-mcp` (owner `linxule`, repo, workflow `publish-mcp.yml`, Environment blank; 2FA mode = "2FA **or** automation tokens"). Migrated npm→bun at v1.1.4 (the old `package-lock.json` was stale).
