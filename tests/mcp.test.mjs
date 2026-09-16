@@ -23,6 +23,11 @@ async function mockApi(t) {
     else if (req.url === '/extract/task/batch') data = { batch_id: 'batch-1' };
     else if (req.url === '/extract/task/task-1') data = { task_id: 'task-1', state: 'running', extract_progress: { extracted_pages: 2, total_pages: 5 } };
     else if (req.url === '/extract-results/batch/batch-1') data = { batch_id: 'batch-1', extract_result: Array.from({ length: 12 }, (_, i) => ({ file_name: `paper-${i}.pdf`, state: 'pending' })) };
+    else if (req.url === '/extract-results/batch/batch-long') data = { batch_id: 'batch-long', extract_result: [
+      { file_name: 'book.pdf', data_id: 'book__p00201-00400', state: 'running', extract_progress: { extracted_pages: 3, total_pages: 200 } },
+      { file_name: 'book.pdf', data_id: 'book__p00001-00200', state: 'done', full_zip_url: 'https://cdn.example.test/1.zip' },
+      { file_name: 'book.pdf', data_id: 'book__p00401-00450', state: 'failed', err_msg: 'number of pages exceeds limit' },
+    ] };
     else if (req.url === '/extract/task/expired') {
       res.writeHead(401, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ code: 'A0211', msg: 'expired' }));
@@ -42,7 +47,7 @@ async function mockApi(t) {
 async function verifyTools(client, requests) {
   assert.equal(client.getServerVersion().version, packageVersion);
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map(tool => tool.name).sort(), ['mineru_batch', 'mineru_batch_status', 'mineru_download_results', 'mineru_parse', 'mineru_status', 'mineru_upload_batch']);
+  assert.deepEqual(tools.map(tool => tool.name).sort(), ['mineru_batch', 'mineru_batch_status', 'mineru_download_results', 'mineru_merge_slices', 'mineru_parse', 'mineru_parse_long', 'mineru_status', 'mineru_upload_batch']);
   assert.deepEqual(tools.find(tool => tool.name === 'mineru_parse').inputSchema.required, ['url']);
   const call = (name, args) => client.callTool({ name, arguments: args });
   const parsed = await call('mineru_parse', { url: 'https://example.test/paper.pdf', ocr: false, formula: false, table: true, formats: ['html'] });
@@ -69,6 +74,26 @@ async function verifyTools(client, requests) {
   assert.equal((await call('mineru_parse', {})).isError, true);
   assert.equal((await call('mineru_batch', { urls: ['a'], model: 'invalid' })).isError, true);
   assert.equal(requests.length, beforeInvalid);
+  // Long documents: one batch of <=200-page page_ranges slices, data_id encodes the range
+  const long = await call('mineru_parse_long', { url: 'https://example.test/book.pdf', total_pages: 450, ocr: true });
+  assert.match(long.content[0].text, /"book" \(450 pages\) queued as 3 slice/);
+  assert.deepEqual(requests.at(-1).body, { model_version: 'pipeline', files: [
+    { data_id: 'book__p00001-00200', page_ranges: '1-200', is_ocr: true, url: 'https://example.test/book.pdf' },
+    { data_id: 'book__p00201-00400', page_ranges: '201-400', is_ocr: true, url: 'https://example.test/book.pdf' },
+    { data_id: 'book__p00401-00450', page_ranges: '401-450', is_ocr: true, url: 'https://example.test/book.pdf' },
+  ] });
+  const small = await call('mineru_parse_long', { url: 'https://example.test/short.pdf', total_pages: 7, slice_size: 3, name: 'my report' });
+  assert.deepEqual(requests.at(-1).body.files.map(f => [f.data_id, f.page_ranges]), [['my_report__p00001-00003', '1-3'], ['my_report__p00004-00006', '4-6'], ['my_report__p00007-00007', '7-7']]);
+  assert.equal((await call('mineru_parse_long', { url: 'https://example.test/x.pdf' })).isError, true); // total_pages required for URLs
+  assert.equal((await call('mineru_parse_long', { url: 'https://example.test/x.pdf', file: '/tmp/x.pdf', total_pages: 5 })).isError, true);
+  // Merge reports per-slice state, ordered by page range, without touching the filesystem
+  const merge = await call('mineru_merge_slices', { batch_id: 'batch-long', output_dir: '/nonexistent/never-written' });
+  assert.equal(merge.isError, undefined);
+  assert.match(merge.content[0].text, /1\/3 slices done/);
+  assert.match(merge.content[0].text, /Still processing: 201-400/);
+  assert.match(merge.content[0].text, /Failed: 401-450 \(number of pages exceeds limit\)/);
+  const notSliced = await call('mineru_merge_slices', { batch_id: 'batch-1', output_dir: '/nonexistent' });
+  assert.equal(notSliced.isError, true);
   const expired = await call('mineru_status', { task_id: 'expired' });
   assert.equal(expired.isError, true);
   assert.match(expired.content[0].text, /Token expired/);
