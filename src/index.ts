@@ -84,6 +84,57 @@ interface BatchStatus {
   }>;
 }
 
+// Long-document slicing (MinerU rejects files >200 pages, but accepts page_ranges on them)
+const MAX_SLICE_PAGES = 200;
+
+function planSlices(totalPages: number, sliceSize: number): Array<[number, number]> {
+  if (!Number.isInteger(totalPages) || totalPages < 1) throw new Error("total_pages must be a positive integer");
+  const size = Math.min(Math.max(1, Math.floor(sliceSize)), MAX_SLICE_PAGES);
+  const slices: Array<[number, number]> = [];
+  for (let start = 1; start <= totalPages; start += size) {
+    slices.push([start, Math.min(start + size - 1, totalPages)]);
+  }
+  return slices;
+}
+
+// data_id must be [A-Za-z0-9_.-], ≤128 chars. Encode the slice so merge can order it.
+function sliceDataId(name: string, start: number, end: number): string {
+  const stem = name.replace(/[^a-zA-Z0-9_\-\.]/g, "_").slice(0, 100) || "document";
+  return `${stem}__p${String(start).padStart(5, "0")}-${String(end).padStart(5, "0")}`;
+}
+
+function parseSliceId(dataId: string | undefined): { name: string; start: number; end: number } | null {
+  const m = dataId?.match(/^(.+)__p(\d{5})-(\d{5})$/);
+  return m ? { name: m[1], start: Number(m[2]), end: Number(m[3]) } : null;
+}
+
+// Depth-limited, symlink-safe finders (zip-slip protection)
+function findEntry(dir: string, targetName: string, baseDir: string, wantDir: boolean, depth = 0): string | null {
+  if (depth > 5) return null;
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isSymbolicLink()) continue;
+    const fullPath = join(dir, entry.name);
+    const matches = entry.name === targetName && (wantDir ? entry.isDirectory() : entry.isFile());
+    if (matches && realpathSync(fullPath).startsWith(realpathSync(baseDir))) return fullPath;
+    if (entry.isDirectory()) {
+      const found = findEntry(fullPath, targetName, baseDir, wantDir, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function downloadAndUnzip(zipUrl: string, tmpBase: string, stem: string): Promise<string> {
+  const zipPath = join(tmpBase, `${stem}.zip`);
+  const response = await axios.get(zipUrl, { responseType: "stream", timeout: 120_000 });
+  await pipeline(response.data, createWriteStream(zipPath));
+  const extractDir = join(tmpBase, stem);
+  mkdirSync(extractDir, { recursive: true });
+  execFileSync("unzip", ["-o", "-q", zipPath, "-d", extractDir], { timeout: 60_000 });
+  unlinkSync(zipPath);
+  return extractDir;
+}
+
 // Format helpers
 function formatConciseStatus(status: TaskStatus): string {
   const parts = [status.state, status.task_id];
@@ -679,6 +730,200 @@ export default function createServer({ config }: { config: Config }) {
       return {
         content: [{ type: "text", text }],
       };
+    }
+  );
+
+  // Tool 7: mineru_parse_long — one document > 200 pages, submitted as ≤200-page slices in one batch
+  server.tool(
+    "mineru_parse_long",
+    "Parse a document LONGER than 200 pages (MinerU's per-file cap) by submitting it as one batch of ≤200-page slices with page_ranges. Give total_pages (from `mdls -name kMDItemNumberOfPages`, `pdfinfo`, or the viewer) — it is auto-detected only for local files on macOS. Returns a batch_id; poll with mineru_batch_status, then stitch with mineru_merge_slices. Files ≤200 pages: use mineru_parse instead.",
+    {
+      url: z.string().optional().describe("Public document URL (preferred)"),
+      file: z.string().optional().describe("Absolute local file path (uploaded once per slice — slow for big files)"),
+      total_pages: z.number().int().positive().optional().describe("Total page count of the document"),
+      slice_size: z.number().int().positive().max(MAX_SLICE_PAGES).optional().default(MAX_SLICE_PAGES).describe("Pages per slice (≤200)"),
+      name: z.string().optional().describe("Output name for the merged result (default: from URL/file name)"),
+      model: z.enum(["pipeline", "vlm"]).optional().describe("pipeline=fast, vlm=90% accuracy"),
+      ocr: z.boolean().optional().describe("Enable OCR (pipeline only)"),
+      formula: z.boolean().optional().describe("Formula recognition"),
+      table: z.boolean().optional().describe("Table recognition"),
+      language: z.string().optional().describe("Language code: ch, en, etc"),
+    },
+    async (params) => {
+      if (!params.url === !params.file) throw new Error("Provide exactly one of 'url' or 'file'.");
+
+      let totalPages = params.total_pages;
+      if (!totalPages && params.file && process.platform === "darwin") {
+        try {
+          const out = execFileSync("mdls", ["-raw", "-name", "kMDItemNumberOfPages", params.file], { timeout: 10_000 }).toString().trim();
+          if (/^\d+$/.test(out)) totalPages = Number(out);
+        } catch { /* fall through to the error below */ }
+      }
+      if (!totalPages) throw new Error("total_pages is required (could not auto-detect). Get it with `mdls -name kMDItemNumberOfPages <file>` or `pdfinfo`.");
+
+      const source = params.url || params.file!;
+      const rawName = params.name || basename(new URL(params.url || `file://${params.file}`).pathname);
+      const name = rawName.replace(extname(rawName), "") || "document";
+      const slices = planSlices(totalPages, params.slice_size);
+      if (slices.length > 200) throw new Error(`${slices.length} slices exceeds the 200-file batch limit; raise slice_size.`);
+
+      const common: Record<string, unknown> = { model_version: params.model || defaultModel };
+      if (params.formula !== undefined) common.enable_formula = params.formula;
+      if (params.table !== undefined) common.enable_table = params.table;
+      if (params.language) common.language = params.language;
+
+      const entries = slices.map(([a, b]) => {
+        const e: Record<string, unknown> = { data_id: sliceDataId(name, a, b), page_ranges: `${a}-${b}` };
+        if (params.ocr !== undefined) e.is_ocr = params.ocr;
+        return e;
+      });
+
+      let batchId: string;
+      const uploadNotes: string[] = [];
+      if (params.url) {
+        const result = await mineruRequest<BatchResponse>("/extract/task/batch", "POST", {
+          ...common,
+          files: entries.map((e) => ({ ...e, url: params.url })),
+        });
+        batchId = result.batch_id;
+      } else {
+        if (!existsSync(params.file!)) throw new Error(`File not found: ${params.file}`);
+        const size = statSync(params.file!).size;
+        if (size > 200 * 1024 * 1024) throw new Error(`File too large (${(size / 1024 / 1024).toFixed(0)}MB). Max 200MB.`);
+        const result = await mineruRequest<BatchFileUploadResponse>("/file-urls/batch", "POST", {
+          ...common,
+          files: entries.map((e) => ({ ...e, name: basename(params.file!) })),
+        });
+        if (result.file_urls.length !== entries.length) throw new Error(`Expected ${entries.length} upload URLs, got ${result.file_urls.length}`);
+        batchId = result.batch_id;
+        const data = readFileSync(params.file!);
+        const timeoutMs = 60_000 + Math.ceil(size / (1024 * 1024)) * 2_000;
+        for (let i = 0; i < result.file_urls.length; i++) {
+          try {
+            const resp = await fetch(result.file_urls[i], { method: "PUT", body: data, signal: AbortSignal.timeout(timeoutMs) });
+            if (!resp.ok) uploadNotes.push(`FAIL slice ${slices[i][0]}-${slices[i][1]}: HTTP ${resp.status}`);
+          } catch (err) {
+            uploadNotes.push(`FAIL slice ${slices[i][0]}-${slices[i][1]}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
+
+      let text = `Batch ${batchId}: "${name}" (${totalPages} pages) queued as ${slices.length} slice(s) of ≤${params.slice_size} pages from ${source}.\n`;
+      text += slices.map(([a, b]) => `  ${sliceDataId(name, a, b)}  pages ${a}-${b}`).join("\n");
+      text += `\nPoll with mineru_batch_status, then mineru_merge_slices(batch_id, output_dir).`;
+      if (uploadNotes.length) text += `\n\nUpload problems:\n${uploadNotes.join("\n")}`;
+      return { content: [{ type: "text", text }] };
+    }
+  );
+
+  // Tool 8: mineru_merge_slices — stitch a sliced batch back into one document
+  server.tool(
+    "mineru_merge_slices",
+    "Stitch the slices of a mineru_parse_long batch into one {name}/{name}.md (+ {name}_content.json with page_idx re-based to the whole document, + images/). Slices are ordered by their page range; each is marked with an HTML comment. Waits for nothing — if any slice is still processing, it reports and you re-run later.",
+    {
+      batch_id: z.string().describe("Batch ID from mineru_parse_long"),
+      output_dir: z.string().describe("Directory to write the merged document folder into"),
+      overwrite: z.boolean().optional().default(false).describe("Overwrite an existing merged folder"),
+    },
+    async (params) => {
+      const batch = await mineruRequest<BatchStatus>(`/extract-results/batch/${params.batch_id}`);
+      const slices = batch.extract_result
+        .map((r) => ({ r, s: parseSliceId(r.data_id) }))
+        .filter((x): x is { r: BatchStatus["extract_result"][number]; s: NonNullable<ReturnType<typeof parseSliceId>> } => x.s !== null)
+        .sort((a, b) => a.s.start - b.s.start);
+      if (slices.length === 0) throw new Error("No slice entries in this batch (data_id must look like name__p00001-00200). Was it created by mineru_parse_long?");
+
+      const pending = slices.filter((x) => ["pending", "running", "converting"].includes(x.r.state));
+      const failed = slices.filter((x) => x.r.state === "failed");
+      if (pending.length || failed.length) {
+        let text = `Batch ${params.batch_id}: ${slices.length - pending.length - failed.length}/${slices.length} slices done.`;
+        if (pending.length) text += `\nStill processing: ${pending.map((x) => `${x.s.start}-${x.s.end}`).join(", ")}`;
+        if (failed.length) text += `\nFailed: ${failed.map((x) => `${x.s.start}-${x.s.end} (${x.r.err_msg || "no message"})`).join("; ")}\nRe-submit failed ranges with mineru_parse(pages=...) or fix and re-run mineru_parse_long.`;
+        if (pending.length) text += `\nRe-run mineru_merge_slices when all slices are done.`;
+        return { content: [{ type: "text", text }] };
+      }
+
+      const name = slices[0].s.name;
+      const outDir = join(params.output_dir, name);
+      if (existsSync(outDir)) {
+        if (!params.overwrite) throw new Error(`${outDir} exists. Pass overwrite=true to replace it.`);
+        rmSync(outDir, { recursive: true, force: true });
+      }
+      const imagesOut = join(outDir, "images");
+      mkdirSync(imagesOut, { recursive: true });
+
+      const tmpBase = join(tmpdir(), `mineru-merge-${Date.now()}-${randomBytes(4).toString("hex")}`);
+      mkdirSync(tmpBase, { recursive: true });
+
+      const mdParts: string[] = [];
+      const contentList: unknown[] = [];
+      const notes: string[] = [];
+      let imageCount = 0;
+      try {
+        for (const { r, s } of slices) {
+          const tag = `p${String(s.start).padStart(5, "0")}-${String(s.end).padStart(5, "0")}`;
+          const extractDir = await downloadAndUnzip(r.full_zip_url!, tmpBase, tag);
+
+          const mdFile = findEntry(extractDir, "full.md", extractDir, false);
+          if (!mdFile) { notes.push(`slice ${s.start}-${s.end}: no full.md`); continue; }
+          // Prefix image refs so slices can't collide on MinerU's per-zip image names
+          const md = readFileSync(mdFile, "utf-8").replace(/\]\(images\//g, `](images/${tag}_`);
+          mdParts.push(`<!-- mineru slice: pages ${s.start}-${s.end} -->\n\n${md.trim()}\n`);
+
+          const imagesDir = findEntry(extractDir, "images", extractDir, true);
+          if (imagesDir) {
+            for (const entry of readdirSync(imagesDir, { withFileTypes: true })) {
+              if (entry.isFile() && !entry.isSymbolicLink()) {
+                copyFileSync(join(imagesDir, entry.name), join(imagesOut, `${tag}_${entry.name}`));
+                imageCount++;
+              }
+            }
+          }
+
+          const contentFile = findEntry(extractDir, "content_list_v2.json", extractDir, false)
+            || findEntry(extractDir, "content_list.json", extractDir, false);
+          if (contentFile) {
+            try {
+              const items = JSON.parse(readFileSync(contentFile, "utf-8"));
+              const offset = s.start - 1; // slice page_idx is 0-based within the slice
+              const rebase = (item: unknown): unknown => {
+                if (Array.isArray(item)) return item.map(rebase);
+                if (item && typeof item === "object") {
+                  const o = { ...(item as Record<string, unknown>) };
+                  if (typeof o.page_idx === "number") o.page_idx = o.page_idx + offset;
+                  if (typeof o.img_path === "string") o.img_path = o.img_path.replace(/^images\//, `images/${tag}_`);
+                  for (const k of Object.keys(o)) if (k !== "page_idx") o[k] = rebase(o[k]);
+                  return o;
+                }
+                return item;
+              };
+              const rebased = rebase(items);
+              if (Array.isArray(rebased)) contentList.push(...rebased); else contentList.push(rebased);
+            } catch (err) {
+              notes.push(`slice ${s.start}-${s.end}: content list unreadable (${err instanceof Error ? err.message : String(err)})`);
+            }
+          }
+        }
+      } finally {
+        try { rmSync(tmpBase, { recursive: true, force: true }); } catch { /* ignore */ }
+      }
+
+      const mdPath = join(outDir, `${name}.md`);
+      const fh = createWriteStream(mdPath);
+      for (const part of mdParts) fh.write(part + "\n");
+      await new Promise<void>((resolve, reject) => { fh.on("error", reject); fh.end(resolve); });
+      if (contentList.length) {
+        const cfh = createWriteStream(join(outDir, `${name}_content.json`));
+        cfh.write(JSON.stringify(contentList));
+        await new Promise<void>((resolve, reject) => { cfh.on("error", reject); cfh.end(resolve); });
+      }
+
+      const titleMatch = mdParts[0]?.match(/^#\s+(.+)/m);
+      let text = `Merged ${mdParts.length}/${slices.length} slices (pages 1-${slices[slices.length - 1].s.end}) -> ${mdPath}`;
+      if (titleMatch) text += `\nTitle: "${titleMatch[1].trim().slice(0, 120)}"`;
+      text += `\nImages: ${imageCount} | content list items: ${contentList.length} (page_idx is whole-document, 0-based)`;
+      if (notes.length) text += `\n\nNotes:\n${notes.join("\n")}`;
+      return { content: [{ type: "text", text }] };
     }
   );
 
