@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.linxule/mineru",
   "title": "MinerU",
-  "description": "MinerU document parsing API — PDFs, images, DOCX, PPTX with OCR and batch processing.",
+  "description": "MinerU document parsing API \u2014 PDFs, images, DOCX, PPTX with OCR and batch processing.",
   "repository": {
     "url": "https://github.com/linxule/mineru-mcp",
     "source": "github",
     "id": "1114406164"
   },
-  "version": "1.1.6",
+  "version": "1.2.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "mineru-mcp",
-      "version": "1.1.6",
+      "version": "1.2.0",
       "transport": {
         "type": "stdio"
       },

@@ -8,12 +8,12 @@ MCP server for MinerU document parsing API — PDF/DOC/PPT/images to markdown.
 - **Package manager**: bun
 - **Build**: `bun run build` (outputs to `dist/`)
 - **Dev**: `bun run dev` (tsx, stdio mode)
-- **Entry**: `src/index.ts` (stdio) / `src/server.ts` (HTTP)
+- **Entry**: `src/index.ts` (stdio) / `src/server.ts` (HTTP) / `src/cli.ts` (`mineru-cloud` — runs the server in-process over `InMemoryTransport` and calls its tools; one implementation, two channels)
 
 ## API Key Management
 
 - **Provider**: MinerU (OpenXLab) — https://mineru.net
-- **Format**: JWT token (Bearer auth)
+- **Format**: Bearer token. Older keys were JWTs (decode `exp` below); keys issued in 2026 are opaque `sk-…` strings — the decode snippet then fails, and the only expiry check is a live probe: `GET /extract/task/probe` → `-60012` means authenticated, `401/403` means expired.
 - **Expiry**: Tokens auto-expire after ~90 days from issuance
 - **Don't hard-code the expiry date here** — a stale one is worse than none. (This line used to read "Current key expires: 2026-05-19" and sat ~2 months past that, presenting an expired key as current.) Read the real expiry from the token itself:
   ```bash
@@ -26,7 +26,7 @@ MCP server for MinerU document parsing API — PDF/DOC/PPT/images to markdown.
 
 ## Architecture
 
-Single-file server (`src/index.ts`, ~695 lines) with 6 tools:
+Single-file server (`src/index.ts`, ~1000 lines) with 8 tools:
 
 | Tool | Purpose | Flow |
 |------|---------|------|
@@ -36,6 +36,8 @@ Single-file server (`src/index.ts`, ~695 lines) with 6 tools:
 | `mineru_batch_status` | Check batch progress | Poll with `batch_id` |
 | `mineru_upload_batch` | Upload local files (slow, use URLs when possible) | Returns `batch_id` |
 | `mineru_download_results` | Download named paper folders | Uses `batch_id`, saves to `output_dir` |
+| `mineru_parse_long` | Document >200 pages | One batch of ≤200-page `page_ranges` slices; `data_id` = `name__pAAAAA-BBBBB` |
+| `mineru_merge_slices` | Stitch a sliced batch | Orders by `data_id`, prefixes images per slice, re-bases `page_idx` |
 
 ### URL workflow (preferred)
 
@@ -85,6 +87,8 @@ output_dir/
 - **`{stem}.md`** — full paper as markdown (essential, always present)
 - **`{stem}_content.json`** — structured content list with element types (title, paragraph, table, figure) and bounding boxes; useful for AI agents to quickly locate sections/figures without scanning full markdown
 - **`images/`** — extracted figures and tables referenced by the markdown
+
+MinerU names files inside the zip `<task-uuid>_<name>` (`<uuid>_content_list_v2.json`) — finders match on suffix (fixed 1.2.0; before that `_content.json` was silently skipped).
 
 Naming uses `author_year_title` convention from the original filename, with spaces → underscores, special chars sanitized, max 128 chars.
 
