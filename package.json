@@ -1,11 +1,12 @@
 {
   "name": "mineru-mcp",
-  "version": "1.1.6",
-  "description": "MCP server for MinerU document parsing API - optimized for Claude Code with 73% token reduction",
+  "version": "1.2.0",
+  "description": "MinerU document-parsing cloud API as an MCP server and a CLI (mineru-cloud) \u2014 batch by URL, long documents in \u2264200-page slices, 73% token reduction",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "mineru-mcp": "dist/index.js"
+    "mineru-mcp": "dist/index.js",
+    "mineru-cloud": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -20,7 +21,8 @@
     "dev:http": "tsx src/server.ts",
     "prepublishOnly": "bun run build",
     "test": "node --test tests/*.test.mjs",
-    "test:package": "node scripts/test-package.mjs"
+    "test:package": "node scripts/test-package.mjs",
+    "cli": "node dist/cli.js"
   },
   "keywords": [
     "mcp",
@@ -33,7 +35,8 @@
     "claude-code",
     "anthropic",
     "ai",
-    "llm"
+    "llm",
+    "cli"
   ],
   "author": "Xule Lin",
   "license": "MIT",

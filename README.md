@@ -10,6 +10,8 @@ MCP server for [MinerU](https://mineru.net) document parsing API — extract tex
 - **Batch processing** — Parse up to 200 documents at once
 - **Download & rename** — Extract markdown with original filenames
 - **Page ranges** — Extract specific pages only
+- **Long documents** — MinerU caps files at 200 pages; `mineru_parse_long` slices and `mineru_merge_slices` stitches
+- **CLI twin** — `mineru-cloud` runs the same tools from a shell (no MCP context cost)
 - **109 language OCR** support
 - **Optimized for Claude Code** — 73% token reduction vs alternatives
 
@@ -23,6 +25,8 @@ MCP server for [MinerU](https://mineru.net) document parsing API — extract tex
 | `mineru_batch_status` | Get batch results with pagination |
 | `mineru_upload_batch` | Upload local files for batch parsing |
 | `mineru_download_results` | Download results as named markdown files |
+| `mineru_parse_long` | Document >200 pages: one batch of ≤200-page `page_ranges` slices |
+| `mineru_merge_slices` | Stitch a sliced batch into one `{name}.md` + `{name}_content.json` (page_idx re-based) + `images/` |
 
 ## Installation
 
@@ -216,6 +220,27 @@ codex mcp add mineru --env MINERU_API_KEY=your-api-key -- cmd /c npx -y mineru-m
 ### ChatGPT
 
 ChatGPT only supports remote MCP servers over HTTPS — local stdio servers like this one are not directly supported. You would need to deploy behind a public URL with HTTP transport.
+
+## CLI: `mineru-cloud`
+
+Every tool is also a shell command — the CLI runs the MCP server in-process over an in-memory
+transport, so the two can't drift. Same env vars (`MINERU_API_KEY`, `MINERU_BASE_URL`,
+`MINERU_DEFAULT_MODEL`).
+
+```bash
+mineru-cloud list                                    # commands + options (from the tool schemas)
+mineru-cloud parse --url https://arxiv.org/pdf/2303.08774 --pages 1-10
+mineru-cloud status --task-id <id> --wait            # --wait polls every 10s until done/failed
+mineru-cloud batch --urls '["https://…/a.pdf","https://…/b.pdf"]'
+mineru-cloud download-results --batch-id <id> --output-dir ./papers --wait
+
+# > 200 pages: slice, then stitch
+mineru-cloud parse-long --url https://…/book.pdf --total-pages 520 --name book
+mineru-cloud merge-slices --batch-id <id> --output-dir ./books --wait
+```
+
+Options mirror the tool parameters with `_` → `-` (`--total-pages`, `--output-dir`); numbers,
+`true`/`false` and JSON arrays are coerced. Install: `bun add -g mineru-mcp` (or `npm i -g`).
 
 ## Configuration
 

@@ -114,7 +114,8 @@ function findEntry(dir: string, targetName: string, baseDir: string, wantDir: bo
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (entry.isSymbolicLink()) continue;
     const fullPath = join(dir, entry.name);
-    const matches = entry.name === targetName && (wantDir ? entry.isDirectory() : entry.isFile());
+    // MinerU prefixes files with the task uuid ("<uuid>_content_list_v2.json"), so match on suffix
+    const matches = (entry.name === targetName || entry.name.endsWith(`_${targetName}`)) && (wantDir ? entry.isDirectory() : entry.isFile());
     if (matches && realpathSync(fullPath).startsWith(realpathSync(baseDir))) return fullPath;
     if (entry.isDirectory()) {
       const found = findEntry(fullPath, targetName, baseDir, wantDir, depth + 1);
@@ -126,8 +127,17 @@ function findEntry(dir: string, targetName: string, baseDir: string, wantDir: bo
 
 async function downloadAndUnzip(zipUrl: string, tmpBase: string, stem: string): Promise<string> {
   const zipPath = join(tmpBase, `${stem}.zip`);
-  const response = await axios.get(zipUrl, { responseType: "stream", timeout: 120_000 });
-  await pipeline(response.data, createWriteStream(zipPath));
+  // The CDN sometimes drops the first connection right after a result is published ("aborted"); retry once.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const response = await axios.get(zipUrl, { responseType: "stream", timeout: 120_000 });
+      await pipeline(response.data, createWriteStream(zipPath));
+      break;
+    } catch (err) {
+      if (attempt >= 3) throw err;
+      await new Promise((r) => setTimeout(r, 2_000 * attempt));
+    }
+  }
   const extractDir = join(tmpBase, stem);
   mkdirSync(extractDir, { recursive: true });
   execFileSync("unzip", ["-o", "-q", zipPath, "-d", extractDir], { timeout: 60_000 });
@@ -585,7 +595,7 @@ export default function createServer({ config }: { config: Config }) {
         for (const entry of entries) {
           if (entry.isSymbolicLink()) continue; // skip symlinks (zip slip protection)
           const fullPath = join(dir, entry.name);
-          if (entry.isFile() && entry.name === targetName) {
+          if (entry.isFile() && (entry.name === targetName || entry.name.endsWith(`_${targetName}`))) {
             const realPath = realpathSync(fullPath);
             if (!realPath.startsWith(realpathSync(baseDir))) continue;
             return fullPath;
