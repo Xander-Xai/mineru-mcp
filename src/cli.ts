@@ -33,17 +33,26 @@ function usage(tools: Array<{ name: string; description?: string }>): string {
   return lines.join("\n");
 }
 
-function coerce(v: string): unknown {
-  if (v === "true") return true;
-  if (v === "false") return false;
-  if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
-  if (/^[\[{]/.test(v)) {
-    try { return JSON.parse(v); } catch { /* keep string */ }
+type PropSchema = { type?: string | string[]; anyOf?: PropSchema[]; enum?: unknown[] };
+
+// Coerce by the tool's declared type, so `--name 2026` stays a string and `--total-pages 450` becomes a number.
+function coerce(v: string, schema: PropSchema | undefined): unknown {
+  const types = new Set<string>();
+  const collect = (p?: PropSchema) => {
+    if (!p) return;
+    for (const t of Array.isArray(p.type) ? p.type : p.type ? [p.type] : []) types.add(t);
+    p.anyOf?.forEach(collect);
+  };
+  collect(schema);
+  if (types.has("boolean") && (v === "true" || v === "false")) return v === "true";
+  if ((types.has("number") || types.has("integer")) && /^-?\d+(\.\d+)?$/.test(v)) return Number(v);
+  if ((types.has("array") || types.has("object")) && /^[\[{]/.test(v)) {
+    try { return JSON.parse(v); } catch { /* fall through: the tool will report the schema error */ }
   }
   return v;
 }
 
-function parseArgs(argv: string[]): { command: string | undefined; args: Record<string, unknown>; wait: boolean } {
+function parseArgs(argv: string[], props: Record<string, PropSchema>): { command: string | undefined; args: Record<string, unknown>; wait: boolean } {
   const [command, ...rest] = argv;
   const args: Record<string, unknown> = {};
   let wait = false;
@@ -57,16 +66,34 @@ function parseArgs(argv: string[]): { command: string | undefined; args: Record<
     if (eq >= 0) { val = key.slice(eq + 1); key = key.slice(0, eq); }
     else if (i + 1 < rest.length && !rest[i + 1].startsWith("--")) { val = rest[++i]; }
     else { val = "true"; }
-    args[key.replace(/-/g, "_")] = coerce(val);
+    const name = key.replace(/-/g, "_");
+    args[name] = coerce(val, props[name]);
   }
   return { command, args, wait };
 }
 
-const STILL_WORKING = /still processing|still running|pending|\brunning\b|converting|Try again later|Re-run/i;
-const FINISHED = /^(done|failed)\b|^Merged|Downloaded to:/m;
+// --wait keeps polling only while the tool's own output says work is still in flight.
+// A failed task/slice is final: surface it, don't wait 30 min for it to change.
+function stillWorking(command: string, text: string): boolean {
+  switch (command) {
+    case "status":            // "running | <id> | 2/5 pages" (concise) or JSON (detailed)
+      return /^(pending|running|converting)\b/.test(text) || /"state":\s*"(pending|running|converting)"/.test(text);
+    case "batch-status": {    // "Batch <id>: 3/12 done" — done only counts finished-ok; failed ones never finish
+      const m = text.match(/^Batch \S+: (\d+)\/(\d+) done/);
+      return !!m && Number(m[1]) < Number(m[2]) && !/: failed\b/.test(text);
+    }
+    case "download-results":  // "... Still processing: N" appears whether or not some files were downloaded
+      return /still processing: [1-9]/i.test(text);
+    case "merge-slices":      // "Still processing: 201-400" — absent when only failures remain
+      return /Still processing:/.test(text);
+    default:
+      return false;
+  }
+}
 
 async function main() {
-  const { command, args, wait } = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  const command = argv[0];
 
   const server = createServer({
     config: {
@@ -95,9 +122,12 @@ async function main() {
   }
 
   const toolName = PREFIX + command.replace(/-/g, "_");
-  if (!tools.some((t) => t.name === toolName)) {
+  const tool = tools.find((t) => t.name === toolName);
+  if (!tool) {
     throw new Error(`Unknown command '${command}'. Run 'mineru-cloud list'.`);
   }
+  const props = ((tool.inputSchema as { properties?: Record<string, PropSchema> }).properties) || {};
+  const { args, wait } = parseArgs(argv, props);
 
   const started = Date.now();
   for (;;) {
@@ -105,8 +135,7 @@ async function main() {
     const text = (result.content as Array<{ type: string; text?: string }>)
       .filter((c) => c.type === "text").map((c) => c.text || "").join("\n");
     if (result.isError) throw new Error(text);
-    const stillWorking = wait && STILL_WORKING.test(text) && !FINISHED.test(text);
-    if (!stillWorking) { console.log(text); return; }
+    if (!(wait && stillWorking(command, text))) { console.log(text); return; }
     if (Date.now() - started > WAIT_MAX_MS) throw new Error(`Gave up waiting after 30 min:\n${text}`);
     process.stderr.write(`[wait] ${text.split("\n")[0].slice(0, 100)}\n`);
     await new Promise((r) => setTimeout(r, POLL_MS));

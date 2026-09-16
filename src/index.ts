@@ -866,7 +866,10 @@ export default function createServer({ config }: { config: Config }) {
       mkdirSync(tmpBase, { recursive: true });
 
       const mdParts: string[] = [];
+      // content_list_v2.json is an array of pages (each an array of blocks) — positional, so
+      // concatenation keeps page order; the older flat content_list.json carries page_idx per block.
       const contentList: unknown[] = [];
+      let contentIsPaged = false;
       const notes: string[] = [];
       let imageCount = 0;
       try {
@@ -875,7 +878,7 @@ export default function createServer({ config }: { config: Config }) {
           const extractDir = await downloadAndUnzip(r.full_zip_url!, tmpBase, tag);
 
           const mdFile = findEntry(extractDir, "full.md", extractDir, false);
-          if (!mdFile) { notes.push(`slice ${s.start}-${s.end}: no full.md`); continue; }
+          if (!mdFile) { notes.push(`slice ${s.start}-${s.end}: no full.md in zip — its images and content list were skipped too`); continue; }
           // Prefix image refs so slices can't collide on MinerU's per-zip image names
           const md = readFileSync(mdFile, "utf-8").replace(/\]\(images\//g, `](images/${tag}_`);
           mdParts.push(`<!-- mineru slice: pages ${s.start}-${s.end} -->\n\n${md.trim()}\n`);
@@ -901,19 +904,25 @@ export default function createServer({ config }: { config: Config }) {
                 if (item && typeof item === "object") {
                   const o = { ...(item as Record<string, unknown>) };
                   if (typeof o.page_idx === "number") o.page_idx = o.page_idx + offset;
-                  if (typeof o.img_path === "string") o.img_path = o.img_path.replace(/^images\//, `images/${tag}_`);
                   for (const k of Object.keys(o)) if (k !== "page_idx") o[k] = rebase(o[k]);
                   return o;
                 }
+                // any image reference, whatever the key, follows the same per-slice prefix as the markdown
+                if (typeof item === "string" && item.startsWith("images/")) return `images/${tag}_${item.slice(7)}`;
                 return item;
               };
               const rebased = rebase(items);
+              if (Array.isArray(rebased) && rebased.every(Array.isArray)) contentIsPaged = true;
               if (Array.isArray(rebased)) contentList.push(...rebased); else contentList.push(rebased);
             } catch (err) {
               notes.push(`slice ${s.start}-${s.end}: content list unreadable (${err instanceof Error ? err.message : String(err)})`);
             }
           }
         }
+      } catch (err) {
+        // Don't leave a half-written folder that the next run would refuse to overwrite
+        try { rmSync(outDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        throw err;
       } finally {
         try { rmSync(tmpBase, { recursive: true, force: true }); } catch { /* ignore */ }
       }
@@ -931,7 +940,9 @@ export default function createServer({ config }: { config: Config }) {
       const titleMatch = mdParts[0]?.match(/^#\s+(.+)/m);
       let text = `Merged ${mdParts.length}/${slices.length} slices (pages 1-${slices[slices.length - 1].s.end}) -> ${mdPath}`;
       if (titleMatch) text += `\nTitle: "${titleMatch[1].trim().slice(0, 120)}"`;
-      text += `\nImages: ${imageCount} | content list items: ${contentList.length} (page_idx is whole-document, 0-based)`;
+      text += contentIsPaged
+        ? `\nImages: ${imageCount} | content list: ${contentList.length} pages (array-per-page, whole-document order)`
+        : `\nImages: ${imageCount} | content list items: ${contentList.length} (page_idx re-based to the whole document, 0-based)`;
       if (notes.length) text += `\n\nNotes:\n${notes.join("\n")}`;
       return { content: [{ type: "text", text }] };
     }
