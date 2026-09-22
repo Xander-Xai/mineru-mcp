@@ -21,8 +21,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f pnpm-lock.yaml ]; then corepack enable; pnpm install --frozen-lockfile; pnpm run build --if-present; elif [ -f package-lock.json ]; then npm ci; npm run build --if-present; else npm install; npm run build --if-present; fi
-          npm pack --json > "$RUNNER_TEMP/pack.json"
+          if [ -f pnpm-lock.yaml ]; then corepack enable; pnpm install --frozen-lockfile; if node -e "process.exit(require(\"./package.json\").scripts?.build?0:1)"; then pnpm run build; fi; elif [ -f package-lock.json ]; then npm ci; npm run build --if-present; else npm install; npm run build --if-present; fi
+          npm pack --json 2>/dev/null > "$RUNNER_TEMP/pack.json"
           ARTIFACT=$(python -c 'import json; print(json.load(open("'"$RUNNER_TEMP"'/pack.json"))[0]["filename"])')
           mkdir -p "$RUNNER_TEMP/artifact"; mv "$ARTIFACT" "$RUNNER_TEMP/artifact/release.tgz"
           sha256sum "$RUNNER_TEMP/artifact/release.tgz" | tee "$RUNNER_TEMP/artifact.sha256"
@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
           git clone https://github.com/Xander-Xai/mcp-evidence-producer-trivy.git "$RUNNER_TEMP/producer"
           git -C "$RUNNER_TEMP/producer" checkout --detach "$PRODUCER_SHA"
-          python -m venv "$RUNNER_TEMP/venv"; source "$RUNNER_TEMP/venv/bin/activate"; pip install -q -r "$RUNNER_TEMP/producer/requirements.txt"
+          python -m venv "$RUNNER_TEMP/venv"; source "$RUNNER_TEMP/venv/bin/activate"; pip install -q -e "$RUNNER_TEMP/producer"
           set +e
           python -m src.producer --trivy "$RUNNER_TEMP/trivy" --artifact "$RUNNER_TEMP/artifact/release.tgz" --out "$RUNNER_TEMP/producer-out"
           echo $? > "$RUNNER_TEMP/producer.exit"; set -e
