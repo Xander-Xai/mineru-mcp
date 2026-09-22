@@ -80,4 +80,8 @@ jobs:
           cat "$RUNNER_TEMP/bundle/pilot-manifest.json" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
-        with:`n          name: mcp-evidence-gate-pilot-${{ github.sha }}`n          path: ${{ runner.temp }}/bundle`n          retention-days: 90`n          if-no-files-found: warn
+        with:
+          name: mcp-evidence-gate-pilot-${{ github.sha }}
+          path: ${{ runner.temp }}/bundle
+          retention-days: 90
+          if-no-files-found: warn
