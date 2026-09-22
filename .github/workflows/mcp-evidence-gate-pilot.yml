@@ -1,4 +1,4 @@
-name: MCP Evidence Gate adoption pilot
+name: MCP Evidence Gate adoption pilot Wave 1.5
 on: [workflow_dispatch]
 permissions:
   contents: read
@@ -14,18 +14,34 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-        with: {node-version: 24}
+        with:
+          node-version: 24
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with: {python-version: '3.11'}
-      - name: Build would-be artifact
+        with:
+          python-version: '3.11'
+      - name: Build and capture exact npm artifact
+        id: pack
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f pnpm-lock.yaml ]; then corepack enable; pnpm install --frozen-lockfile; if node -e "process.exit(require(\"./package.json\").scripts?.build?0:1)"; then pnpm run build; fi; elif [ -f package-lock.json ]; then npm ci; npm run build --if-present; else npm install; npm run build --if-present; fi
-          npm pack --json 2>/dev/null > "$RUNNER_TEMP/pack.json"
-          ARTIFACT=$(python -c 'import json; print(json.load(open("'"$RUNNER_TEMP"'/pack.json"))[0]["filename"])')
-          mkdir -p "$RUNNER_TEMP/artifact"; mv "$ARTIFACT" "$RUNNER_TEMP/artifact/release.tgz"
-          sha256sum "$RUNNER_TEMP/artifact/release.tgz" | tee "$RUNNER_TEMP/artifact.sha256"
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+            if node -e 'process.exit(require("./package.json").scripts?.build?0:1)'; then pnpm run build; fi
+          elif [ -f package-lock.json ]; then npm ci; npm run build --if-present
+          else npm install; npm run build --if-present
+          fi
+          d="$RUNNER_TEMP/pack"; mkdir -p "$d"
+          before="$RUNNER_TEMP/before"; after="$RUNNER_TEMP/after"
+          find "$d" -maxdepth 1 -type f -printf '%f\n' | sort > "$before"
+          (cd "$d" && npm pack --silent) > "$RUNNER_TEMP/pack.stdout"
+          find "$d" -maxdepth 1 -type f -printf '%f\n' | sort > "$after"
+          mapfile -t new < <(comm -13 "$before" "$after" | grep '\.tgz$' || true)
+          test "${#new[@]}" -eq 1
+          artifact="$d/${new[0]}"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          sha256sum "$artifact" | tee "$RUNNER_TEMP/artifact.sha256"
+          stat -c 'artifact=%n size=%s' "$artifact" >> "$GITHUB_STEP_SUMMARY"
       - name: Download and verify pinned Trivy
         shell: bash
         run: |
@@ -36,52 +52,72 @@ jobs:
           echo "${TRIVY_EXECUTABLE_SHA256}  $RUNNER_TEMP/trivy" | sha256sum --check --strict
           "$RUNNER_TEMP/trivy" --version
       - name: Run immutable Producer
+        id: producer
         shell: bash
         run: |
-          set -euo pipefail
+          set -u
           git clone https://github.com/Xander-Xai/mcp-evidence-producer-trivy.git "$RUNNER_TEMP/producer"
           git -C "$RUNNER_TEMP/producer" checkout --detach "$PRODUCER_SHA"
-          python -m venv "$RUNNER_TEMP/venv"; source "$RUNNER_TEMP/venv/bin/activate"; pip install -q -e "$RUNNER_TEMP/producer"
+          python -m venv "$RUNNER_TEMP/venv"
+          source "$RUNNER_TEMP/venv/bin/activate"
+          pip install -q -e "$RUNNER_TEMP/producer"
+          cd "$RUNNER_TEMP/producer"
           set +e
-          python -m src.producer --trivy "$RUNNER_TEMP/trivy" --artifact "$RUNNER_TEMP/artifact/release.tgz" --out "$RUNNER_TEMP/producer-out"
-          echo $? > "$RUNNER_TEMP/producer.exit"; set -e
-      - name: Run immutable Core and digest-negative control
+          python -m src.producer --trivy "$RUNNER_TEMP/trivy" --artifact "${{ steps.pack.outputs.artifact }}" --out "$RUNNER_TEMP/producer-out"
+          code=$?
+          set -e
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          for f in receipt evidence; do echo "$f=$RUNNER_TEMP/producer-out/$f.json" >> "$GITHUB_OUTPUT"; done
+          exit 0
+      - name: Prepare digest-negative artifact
+        id: tamper
         shell: bash
         run: |
           set -euo pipefail
-          git clone https://github.com/Xander-Xai/mcp-evidence-gate.git "$RUNNER_TEMP/core"
-          git -C "$RUNNER_TEMP/core" checkout --detach "$CORE_RUNTIME_SHA"
-          corepack enable; pnpm --dir "$RUNNER_TEMP/core" install --frozen-lockfile; pnpm --dir "$RUNNER_TEMP/core" build
-          set +e
-          node "$RUNNER_TEMP/core/dist/cli.js" verify --receipt "$RUNNER_TEMP/producer-out/receipt.json" --artifact "$RUNNER_TEMP/artifact/release.tgz" --evidence "$RUNNER_TEMP/producer-out/evidence.json" --policy permissive --format json > "$RUNNER_TEMP/core.json"; echo $? > "$RUNNER_TEMP/core.exit"
-          cp "$RUNNER_TEMP/artifact/release.tgz" "$RUNNER_TEMP/artifact-tampered.tgz"; printf '\n' >> "$RUNNER_TEMP/artifact-tampered.tgz"
-          node "$RUNNER_TEMP/core/dist/cli.js" verify --receipt "$RUNNER_TEMP/producer-out/receipt.json" --artifact "$RUNNER_TEMP/artifact-tampered.tgz" --evidence "$RUNNER_TEMP/producer-out/evidence.json" --policy permissive --format json > "$RUNNER_TEMP/core-negative.json"; echo $? > "$RUNNER_TEMP/core-negative.exit"; set -e
-      - name: Assemble evidence and summary
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/bundle"
-          cp "$RUNNER_TEMP/artifact.sha256" "$RUNNER_TEMP/bundle/artifact.sha256" || true
-          cp "$RUNNER_TEMP/producer-out"/{receipt.json,evidence.json,trivy.raw.json,trivy.stderr.log} "$RUNNER_TEMP/bundle/" || true
-          cp "$RUNNER_TEMP/core.json" "$RUNNER_TEMP/core-negative.json" "$RUNNER_TEMP/bundle/" || true
-          python - <<'PY'
-          import json,os,hashlib
-          from pathlib import Path
-          b=Path(os.environ['RUNNER_TEMP'])/'bundle'; out=Path(os.environ['RUNNER_TEMP'])
-          def val(n):
-            try:return json.loads((b/n).read_text())
-            except:return {}
-          r=val('receipt.json'); e=val('evidence.json'); c=val('core.json'); n=val('core-negative.json')
-          m={'upstream_repo':os.environ.get('GITHUB_REPOSITORY'),'upstream_base_sha':os.environ.get('GITHUB_SHA'),'fork_repo':os.environ.get('GITHUB_REPOSITORY'),'experiment_sha':os.environ.get('GITHUB_SHA'),'producer_sha':os.environ['PRODUCER_SHA'],'core_runtime_sha':os.environ['CORE_RUNTIME_SHA'],'artifact_type':'npm-tarball','artifact_sha256':hashlib.sha256((out/'artifact/release.tgz').read_bytes()).hexdigest(),'receipt_verdict':r.get('verdict'),'scanner_execution_status':e.get('scanner_execution',{}).get('completeness_status'),'gate_decision':c.get('decision'),'tampered_artifact_decision':n.get('decision'),'github_run_id':os.environ.get('GITHUB_RUN_ID'),'classification':'COMPATIBLE_PASS' if c.get('decision') in ('pass','warn') and n.get('decision') not in ('pass','warn') else 'COMPATIBLE_INCONCLUSIVE'}
-          (b/'pilot-manifest.json').write_text(json.dumps(m,indent=2)+'\n')
-          print('| Field | Value |\n|---|---|\n| Producer | `'+m['producer_sha']+'` |\n| Core | `'+m['core_runtime_sha']+'` |\n| Receipt | `'+str(m['receipt_verdict'])+'` |\n| Scanner execution | `'+str(m['scanner_execution_status'])+'` |\n| Gate | `'+str(m['gate_decision'])+'` |\n| Tampered | `'+str(m['tampered_artifact_decision'])+'` |\n| Classification | `'+m['classification']+'` |')
-          PY
-          cat "$RUNNER_TEMP/bundle/pilot-manifest.json" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+          cp "${{ steps.pack.outputs.artifact }}" "$RUNNER_TEMP/tampered.tgz"
+          printf '\n' >> "$RUNNER_TEMP/tampered.tgz"
+          echo "artifact=$RUNNER_TEMP/tampered.tgz" >> "$GITHUB_OUTPUT"
+      - name: Verify exact artifact with immutable Core Action
+        id: gate
+        if: ${{ hashFiles(steps.producer.outputs.receipt) != '' }}
+        continue-on-error: true
+        uses: Xander-Xai/mcp-evidence-gate@06567c840c1d68a4b45ff2d12d6e6c32898fff11
         with:
-          name: mcp-evidence-gate-pilot-${{ github.sha }}
-          path: ${{ runner.temp }}/bundle
+          receipt: ${{ steps.producer.outputs.receipt }}
+          artifact: ${{ steps.pack.outputs.artifact }}
+          evidence: ${{ steps.producer.outputs.evidence }}
+          policy: strict-scanner-completeness
+      - name: Verify tampered artifact is blocked
+        id: negative
+        if: ${{ hashFiles(steps.producer.outputs.receipt) != '' }}
+        continue-on-error: true
+        uses: Xander-Xai/mcp-evidence-gate@06567c840c1d68a4b45ff2d12d6e6c32898fff11
+        with:
+          receipt: ${{ steps.producer.outputs.receipt }}
+          artifact: ${{ steps.tamper.outputs.artifact }}
+          evidence: ${{ steps.producer.outputs.evidence }}
+          policy: strict-scanner-completeness
+      - name: Upload immutable evidence bundle
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mcp-evidence-gate-wave15-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/artifact.sha256
+            ${{ runner.temp }}/producer-out/receipt.json
+            ${{ runner.temp }}/producer-out/evidence.json
+            ${{ runner.temp }}/producer-out/trivy.raw.json
+            ${{ runner.temp }}/producer-out/trivy.stderr.log
           retention-days: 90
           if-no-files-found: warn
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Wave 1.5 immutable pilot"
+            echo "Producer: $PRODUCER_SHA"
+            echo "Core runtime: $CORE_RUNTIME_SHA"
+            echo "Gate outcome: ${{ steps.gate.outcome }} / ${{ steps.gate.outputs.decision }}"
+            echo "Tampered outcome: ${{ steps.negative.outcome }} / ${{ steps.negative.outputs.decision }}"
+          } >> "$GITHUB_STEP_SUMMARY"
