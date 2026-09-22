@@ -34,7 +34,7 @@ jobs:
           d="$RUNNER_TEMP/pack"; mkdir -p "$d"
           before="$RUNNER_TEMP/before"; after="$RUNNER_TEMP/after"
           find "$d" -maxdepth 1 -type f -printf '%f\n' | sort > "$before"
-          (cd "$d" && npm pack --silent) > "$RUNNER_TEMP/pack.stdout"
+          npm pack --silent --pack-destination "$d" > "$RUNNER_TEMP/pack.stdout"
           find "$d" -maxdepth 1 -type f -printf '%f\n' | sort > "$after"
           mapfile -t new < <(comm -13 "$before" "$after" | grep '\.tgz$' || true)
           test "${#new[@]}" -eq 1
