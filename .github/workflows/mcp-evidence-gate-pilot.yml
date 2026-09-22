@@ -79,7 +79,7 @@ jobs:
           echo "artifact=$RUNNER_TEMP/tampered.tgz" >> "$GITHUB_OUTPUT"
       - name: Verify exact artifact with immutable Core Action
         id: gate
-        if: always()
+        if: ${{ hashFiles(steps.producer.outputs.receipt) != '' }}
         continue-on-error: true
         uses: Xander-Xai/mcp-evidence-gate@06567c840c1d68a4b45ff2d12d6e6c32898fff11
         with:
@@ -89,7 +89,7 @@ jobs:
           policy: strict-scanner-completeness
       - name: Verify tampered artifact is blocked
         id: negative
-        if: always()
+        if: ${{ hashFiles(steps.producer.outputs.receipt) != '' }}
         continue-on-error: true
         uses: Xander-Xai/mcp-evidence-gate@06567c840c1d68a4b45ff2d12d6e6c32898fff11
         with:
@@ -98,7 +98,7 @@ jobs:
           evidence: ${{ steps.producer.outputs.evidence }}
           policy: strict-scanner-completeness
       - name: Upload immutable evidence bundle
-        if: always()
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: mcp-evidence-gate-wave15-${{ github.sha }}
@@ -111,7 +111,7 @@ jobs:
           retention-days: 90
           if-no-files-found: warn
       - name: Summary
-        if: always()
+        if: ${{ always() }}
         shell: bash
         run: |
           {
